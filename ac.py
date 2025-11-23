@@ -1,86 +1,164 @@
 import tkinter as tk
 from tkinter import ttk
-import threading, time, random
+import threading
+import time
+import random
 from pynput import mouse, keyboard
 
 # ======================================================
-#                 AUTCLICKER CORE
-#               (YOUR ORIGINAL CODE)
+#                 AUTOCLICKER CORE (fixed)
 # ======================================================
-
 class AutoClicker:
     def __init__(self):
         self.running = False
         self.mode = "Hold"
-        self.keybind = None
-        self.listener = None
+        self.keybind = None  # can be keyboard.Key/KeyCode or mouse.Button
+        self.k_listener = None
+        self.m_listener = None
         self.mouse = mouse.Controller()
+        self._listener_lock = threading.Lock()
 
     def set_mode(self, mode):
         self.mode = mode
 
     def set_keybind(self, key):
+        """
+        key will be either:
+         - a pynput.keyboard.Key or KeyCode instance (keyboard)
+         - a pynput.mouse.Button instance (mouse)
+        """
         self.keybind = key
-        self.start_listener()
+        # Ensure runtime listeners are running so the binding is honored
+        self._ensure_runtime_listeners()
 
-    def start_listener(self):
-        if self.listener:
-            try:
-                self.listener.stop()
-            except:
-                pass
+    def _ensure_runtime_listeners(self):
+        # start persistent listeners if not already running
+        with self._listener_lock:
+            if self.k_listener is None:
+                def on_k_press(k):
+                    try:
+                        if self.keybind is None:
+                            return
+                        # only react if keybind is a keyboard key
+                        if isinstance(self.keybind, (keyboard.Key, keyboard.KeyCode)) and k == self.keybind:
+                            if self.mode == "Hold":
+                                self.running = True
+                            elif self.mode == "Toggle":
+                                self.running = not self.running
+                    except Exception:
+                        pass
 
-        if self.keybind is None:
-            return
+                def on_k_release(k):
+                    try:
+                        if self.keybind is None:
+                            return
+                        if isinstance(self.keybind, (keyboard.Key, keyboard.KeyCode)) and k == self.keybind and self.mode == "Hold":
+                            self.running = False
+                    except Exception:
+                        pass
 
-        def on_press(key):
-            try:
-                if key == self.keybind:
-                    if self.mode == "Hold":
-                        self.running = True
-                    elif self.mode == "Toggle":
-                        self.running = not self.running
-            except:
-                pass
+                self.k_listener = keyboard.Listener(on_press=on_k_press, on_release=on_k_release)
+                self.k_listener.daemon = True
+                self.k_listener.start()
 
-        def on_release(key):
-            if key == self.keybind and self.mode == "Hold":
-                self.running = False
+            if self.m_listener is None:
+                def on_m_click(x, y, button, pressed):
+                    try:
+                        if self.keybind is None:
+                            return
+                        # only react if keybind is a mouse.Button
+                        if isinstance(self.keybind, mouse.Button) and button == self.keybind:
+                            if pressed:
+                                if self.mode == "Hold":
+                                    self.running = True
+                                elif self.mode == "Toggle":
+                                    self.running = not self.running
+                            else:
+                                if self.mode == "Hold":
+                                    self.running = False
+                    except Exception:
+                        pass
 
-        self.listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-        self.listener.daemon = True
-        self.listener.start()
+                # note: on_click signature is (x, y, button, pressed)
+                self.m_listener = mouse.Listener(on_click=on_m_click)
+                self.m_listener.daemon = True
+                self.m_listener.start()
+
+    def start_listeners(self):
+        # public method to start runtime listeners (safe to call multiple times)
+        self._ensure_runtime_listeners()
 
     def click_loop(self, get_min, get_max):
+        """
+        Clicking loop runs in background thread.
+        Uses a simple random delay between min_delay and max_delay (converted from CPS),
+        but also includes a small human-like burst jitter to avoid overly regular patterns.
+        """
+        next_click_time = time.time()
         while True:
-            if self.running:
-                # More realistic CPS randomness
-                cps = random.gauss(
-                    (get_min() + get_max()) / 2,
-                    (get_max() - get_min()) / 3
-                )
-                cps = max(get_min(), min(get_max(), cps))
-                delay = 1.0 / cps
+            try:
+                if self.running:
+                    # read values, clamp
+                    min_cps = float(get_min())
+                    max_cps = float(get_max())
+                    if min_cps <= 0: min_cps = 1.0
+                    if max_cps <= 0: max_cps = 1.0
+                    if min_cps > max_cps:
+                        min_cps, max_cps = max_cps, min_cps
 
-                self.mouse.click(mouse.Button.left)
-                time.sleep(delay)
-            else:
-                time.sleep(0.01)
+                    # Choose a burst CPS for a few clicks to simulate human bursts
+                    burst_len = random.randint(1, 4)
+                    burst_cps = random.uniform(min_cps, max_cps)
+
+                    for _ in range(burst_len):
+                        if not self.running:
+                            break
+
+                        # Per-click jitter (±20%)
+                        jitter_factor = random.uniform(0.8, 1.2)
+                        delay = (1.0 / burst_cps) * jitter_factor
+
+                        # micro variation to break patterns
+                        delay += random.uniform(-0.008, 0.008)
+
+                        # safety clamp
+                        if delay < 0.005:
+                            delay = 0.005
+
+                        # schedule/perform click
+                        now = time.time()
+                        # if we are already late, click immediately
+                        if now >= next_click_time:
+                            self.mouse.click(mouse.Button.left)
+                            next_click_time = now + delay
+                        else:
+                            # sleep until next click time or a small fraction
+                            time.sleep(min(next_click_time - now, 0.01))
+                            continue
+
+                        # small chance of human hesitation pause after a burst-click
+                        if random.random() < 0.06:
+                            time.sleep(random.uniform(0.03, 0.12))
+                else:
+                    time.sleep(0.01)
+            except Exception:
+                # be defensive: don't crash the thread
+                time.sleep(0.05)
 
 clicker = AutoClicker()
 
 # ======================================================
-#               YOUR ORIGINAL AUTCLICKER GUI
+#               CLICKER GUI (unchanged look)
 # ======================================================
-
 class ClickerGUI:
     def __init__(self, root):
         self.root = root
-        root.title("")
+        root.title("Anti Anti-Cheat🤓")
         root.geometry("700x450")
         root.configure(bg="#0a0a0a")
         root.resizable(False, False)
 
+        # Colors and fonts
         self.bg = "#0a0a0a"
         self.panel = "#120a20"
         self.purple = "#b366ff"
@@ -99,6 +177,7 @@ class ClickerGUI:
         self._create_main_area()
         self._create_statusbar()
 
+        # start click loop thread once
         threading.Thread(
             target=clicker.click_loop,
             args=(lambda: self.min_cps_var.get(), lambda: self.max_cps_var.get()),
@@ -152,31 +231,62 @@ class ClickerGUI:
         self.log.see(tk.END)
         self.log.config(state=tk.DISABLED)
 
+    # ---------- Keybind picker supports BOTH mouse & keyboard ----------
     def _set_keybind(self):
-        self.keybind_var.set("Press a key...")
+        self.keybind_var.set("Press any key or mouse button...")
 
-        def on_press(key):
+        caught = {"done": False}
+
+        def finish(key):
+            if caught["done"]:
+                return
+            caught["done"] = True
+
+            # store key in clicker and display
             clicker.set_keybind(key)
-            self.keybind_var.set(str(key))
-            listener.stop()
+            # Present a readable label
+            if isinstance(key, mouse.Button):
+                self.keybind_var.set(str(key))  # e.g. "Button.x1"
+            else:
+                self.keybind_var.set(str(key))  # Key or KeyCode string
+
+            # stop pickers
+            try:
+                k_tmp.stop()
+            except Exception:
+                pass
+            try:
+                m_tmp.stop()
+            except Exception:
+                pass
+
             return False
 
-        listener = keyboard.Listener(on_press=on_press)
-        listener.start()
+        def on_k_press(k):
+            finish(k)
+            return False
+
+        def on_m_click(x, y, button, pressed):
+            if pressed:
+                finish(button)
+            return False
+
+        # temp listeners to capture the next input event (keyboard or mouse)
+        k_tmp = keyboard.Listener(on_press=on_k_press)
+        m_tmp = mouse.Listener(on_click=on_m_click)
+        k_tmp.start()
+        m_tmp.start()
 
     def _save_settings(self):
         clicker.set_mode(self.mode_var.get())
-        clicker.start_listener()
-        self._log(
-            f"Settings saved: min {self.min_cps_var.get()}, max {self.max_cps_var.get()}, mode {self.mode_var.get()}, key {self.keybind_var.get()}"
-        )
+        # ensure runtime listeners are active (keyboard + mouse)
+        clicker.start_listeners()
+        self._log(f"Settings saved: min {self.min_cps_var.get()}, max {self.max_cps_var.get()}, mode {self.mode_var.get()}, key {self.keybind_var.get()}")
         self.status_label.config(text="STATUS: settings saved")
-
 
 # ======================================================
 #                   SECRET CALCULATOR
 # ======================================================
-
 class SecretCalculator:
     def __init__(self):
         self.root = tk.Tk()
@@ -211,13 +321,14 @@ class SecretCalculator:
     def _equals(self):
         # SECRET TRIGGER
         if self.expr.replace(" ", "") == "6+7":
+            # open autoclicker window but keep calculator open
             win = tk.Toplevel(self.root)
             ClickerGUI(win)
             return
 
         try:
             result = str(eval(self.expr))
-        except:
+        except Exception:
             result = "ERR"
 
         self.expr = result
@@ -236,7 +347,6 @@ class SecretCalculator:
 
         for (txt, r, c) in buttons:
             cmd = (self._equals if txt == "=" else lambda x=txt: self._press(x))
-
             tk.Button(
                 frame, text=txt, width=4, height=2,
                 font=("Consolas", 18),
@@ -254,7 +364,7 @@ class SecretCalculator:
 
 
 # ======================================================
-#                   START PROGRAM
+#                      START
 # ======================================================
-
-SecretCalculator()
+if __name__ == "__main__":
+    SecretCalculator()
